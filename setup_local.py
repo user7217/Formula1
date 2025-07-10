@@ -92,11 +92,11 @@ address = "0.0.0.0"
 port = 8501
 
 [theme]
-base = "light"
+base = "dark"
 primaryColor = "#ff6b6b"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f0f2f6"
-textColor = "#262730"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#262730"
+textColor = "#fafafa"
 """
     
     config_path = Path(".streamlit/config.toml")

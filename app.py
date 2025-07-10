@@ -24,6 +24,83 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Custom CSS for enhanced dark mode styling
+st.markdown("""
+<style>
+    /* Main container styling */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    
+    /* Header styling */
+    .stTitle {
+        color: #ff6b6b;
+        font-weight: 700;
+        text-align: center;
+        margin-bottom: 0.5rem;
+    }
+    
+    /* Metric cards styling */
+    [data-testid="metric-container"] {
+        background-color: #262730;
+        border: 1px solid #444;
+        padding: 1rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    }
+    
+    /* Sidebar styling */
+    .css-1d391kg {
+        background-color: #1e1e1e;
+    }
+    
+    /* Success/warning/error messages */
+    .stAlert {
+        border-radius: 10px;
+        border-left: 4px solid #ff6b6b;
+    }
+    
+    /* Button styling */
+    .stButton > button {
+        background-color: #ff6b6b;
+        color: white;
+        border-radius: 10px;
+        border: none;
+        font-weight: 600;
+        transition: all 0.3s ease;
+    }
+    
+    .stButton > button:hover {
+        background-color: #ff5252;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(255,107,107,0.3);
+    }
+    
+    /* Expander styling */
+    .streamlit-expanderHeader {
+        background-color: #262730;
+        border-radius: 10px;
+    }
+    
+    /* Progress bar styling */
+    .stProgress > div > div > div > div {
+        background-color: #ff6b6b;
+    }
+    
+    /* Charts background */
+    .js-plotly-plot {
+        background-color: transparent !important;
+    }
+    
+    /* DataFrames styling */
+    .stDataFrame {
+        background-color: #262730;
+        border-radius: 10px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("🏎️ Formula 1 Race Predictor")
 st.markdown("Advanced ML-powered race prediction using FastF1 telemetry data")
 
@@ -61,6 +138,24 @@ if 'models_trained' not in st.session_state:
     st.session_state.models_trained = False
 if 'predictor_ready' not in st.session_state:
     st.session_state.predictor_ready = False
+
+# Dark theme configuration for plotly charts
+def get_dark_theme_layout():
+    """Get consistent dark theme layout for plotly charts"""
+    return {
+        'plot_bgcolor': 'rgba(0,0,0,0)',
+        'paper_bgcolor': 'rgba(0,0,0,0)',
+        'font': {'color': '#fafafa'},
+        'xaxis': {
+            'gridcolor': '#444',
+            'zerolinecolor': '#666'
+        },
+        'yaxis': {
+            'gridcolor': '#444',
+            'zerolinecolor': '#666'
+        },
+        'colorway': ['#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#ffeaa7', '#dda0dd', '#98d8c8']
+    }
 
 # Sidebar navigation
 st.sidebar.title("Navigation")
@@ -505,7 +600,7 @@ elif page == "2024 Validation":
                     title="Prediction Accuracy by Race",
                     markers=True
                 )
-                fig.update_layout(xaxis_tickangle=-45)
+                fig.update_layout(xaxis_tickangle=-45, **get_dark_theme_layout())
                 st.plotly_chart(fig, use_container_width=True)
                 
                 # Detailed results table
@@ -540,7 +635,7 @@ elif page == "Model Performance":
                     title=f"{model_choice} Feature Importance",
                     labels={'x': 'Importance Score', 'y': 'Features'}
                 )
-                fig.update_layout(height=600)
+                fig.update_layout(height=600, **get_dark_theme_layout())
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No model results available for feature analysis.")
@@ -578,10 +673,14 @@ elif page == "Model Performance":
                 polar=dict(
                     radialaxis=dict(
                         visible=True,
-                        range=[0, 1]
-                    )),
+                        range=[0, 1],
+                        gridcolor='#444'
+                    ),
+                    bgcolor='rgba(0,0,0,0)'
+                ),
                 showlegend=True,
-                title="Model Performance Comparison"
+                title="Model Performance Comparison",
+                **get_dark_theme_layout()
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -622,6 +721,7 @@ elif page == "Model Performance":
                 title="Prediction Confidence vs Accuracy",
                 labels={'Prediction Correct': 'Prediction Accuracy (0=Wrong, 1=Correct)'}
             )
+            fig.update_layout(**get_dark_theme_layout())
             st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No validation results available for confidence analysis.")
