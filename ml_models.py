@@ -93,6 +93,7 @@ class MLModelManager:
                                               max_depth=10,
                                               min_samples_split=5,
                                               min_samples_leaf=2,
+                                              max_features='auto',
                                               random_state=42,
                                               n_jobs=-1)
             else:
@@ -100,6 +101,7 @@ class MLModelManager:
                                              max_depth=10,
                                              min_samples_split=5,
                                              min_samples_leaf=2,
+                                             max_features='auto',
                                              random_state=42,
                                              n_jobs=-1)
 
@@ -168,7 +170,8 @@ class MLModelManager:
                 importance_scores = np.abs(model.coef_).flatten()
             else:
                 # For neural networks, use permutation importance approximation
-                importance_scores = np.random.random(len(feature_names)) * 0.1
+                rng = np.random.default_rng(seed=42)
+                importance_scores = rng.random(len(feature_names)) * 0.1
 
             # Create feature importance dictionary
             feature_importance = dict(zip(feature_names, importance_scores))
