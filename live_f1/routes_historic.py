@@ -7,6 +7,33 @@ import numpy as np
 import threading
 from fastapi import APIRouter, HTTPException
 from functools import lru_cache
+from typing import Optional
+
+# primary characteristic per circuit (by FastF1 Location field)
+TRACK_CATEGORIES = {
+    # Power — engine/straight limited, low-downforce
+    'Monza': 'Power', 'Baku': 'Power', 'Jeddah': 'Power',
+    'Las Vegas': 'Power', 'Spielberg': 'Power', 'Silverstone': 'Power',
+    'Spa-Francorchamps': 'Power',
+
+    # Technical — mechanical grip, slow corners, high-downforce
+    'Monaco': 'Technical', 'Budapest': 'Technical', 'Zandvoort': 'Technical',
+    'Barcelona': 'Technical', 'Suzuka': 'Technical', 'Losail': 'Technical',
+
+    # Street — temporary circuit characteristics, walls, bumps
+    'Marina Bay': 'Street', 'Melbourne': 'Street',
+    'Miami': 'Street', 'Montreal': 'Street',
+
+    # Mixed — balanced characteristics
+    'Sakhir': 'Mixed', 'Shanghai': 'Mixed', 'Austin': 'Mixed',
+    'Mexico City': 'Mixed', 'São Paulo': 'Mixed', 'Yas Marina': 'Mixed',
+    'Imola': 'Mixed', 'Portimão': 'Mixed', 'Mugello': 'Mixed',
+    'Nürburgring': 'Mixed', 'Istanbul': 'Mixed', 'Bahrain': 'Mixed',
+    'Lusail': 'Mixed', 'Kyalami': 'Mixed',
+}
+
+CATEGORIES = ['Power', 'Technical', 'Street', 'Mixed']
+
 
 router = APIRouter(prefix="/api/historic")
 
@@ -327,6 +354,73 @@ def _get_session_overview(year: int, race: str, session_type: str = 'R') -> dict
         "start_performance": sorted(start_performance, key=lambda x: x['delta'], reverse=True),
         "consistency": sorted([c for c in consistency if c['variance'] > 0], key=lambda x: x['variance'])
     }
+    
+def _stint_degradation(stint_laps: pd.DataFrame) -> Optional[dict]:
+    clean = stint_laps[
+        (stint_laps['IsAccurate'] == True) &
+        (stint_laps['TrackStatus'].astype(str).isin(['1', '2'])) &
+        stint_laps['LapTime'].notna() &
+        stint_laps['TyreLife'].notna() &
+        stint_laps['PitOutTime'].isna() &
+        stint_laps['PitInTime'].isna()
+    ]
+    if len(clean) < 4:
+        return None
+    x = clean['TyreLife'].to_numpy(dtype=float)
+    y = clean['LapTime'].dt.total_seconds().to_numpy()
+    mask = np.abs(y - y.mean()) < 2 * y.std()
+    x, y = x[mask], y[mask]
+    if len(x) < 4:
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    y_pred = slope * x + intercept
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    # raw points for frontend chart
+    points = [{"tyre_life": float(xi), "lap_time": float(yi)} for xi, yi in zip(x, y)]
+    return {
+        "deg_rate": float(slope),
+        "base_pace": float(intercept),
+        "n_laps": int(len(x)),
+        "r2": float(r2),
+        "points": points,
+    }
+
+
+@lru_cache(maxsize=16)
+def _get_tyre_degradation(year: int, race: str) -> dict:
+    session = _get_safe_session(year, race, 'R')
+    laps = session.laps
+    results = session.results
+
+    drv_team = {str(r['DriverNumber']): str(r['TeamName']) for _, r in results.iterrows()}
+    drv_abbrev = {str(r['DriverNumber']): str(r['Abbreviation']) for _, r in results.iterrows()}
+    stints = []
+
+    for drv in session.drivers:
+        drv_laps = laps.pick_driver(drv)
+        if drv_laps.empty:
+            continue
+        team = drv_team.get(drv, "Unknown")
+        abbrev = drv_abbrev.get(drv, drv)
+        for stint_num, sl in drv_laps.groupby("Stint"):
+            compound = str(sl["Compound"].iloc[0])
+            if compound in ("UNKNOWN", "nan", ""):
+                continue
+            deg = _stint_degradation(sl)
+            if deg is None:
+                continue
+            stints.append({
+                "driver": drv,
+                "abbreviation": abbrev,
+                "team": team,
+                "stint": int(stint_num),
+                "compound": compound,
+                **deg,
+            })
+
+    return {"year": year, "race": race, "stints": stints}
 
 
 @lru_cache(maxsize=8)
@@ -339,10 +433,7 @@ def _get_season_performance(year: int) -> dict:
     teams = {}
     races = []
 
-    track_types = {
-        'Monza': 'High-Speed', 'Spa-Francorchamps': 'High-Speed', 'Las Vegas': 'High-Speed', 'Jeddah': 'High-Speed', 'Baku': 'High-Speed',
-        'Monaco': 'Technical', 'Marina Bay': 'Technical', 'Hungaroring': 'Technical', 'Zandvoort': 'Technical', 'Miami': 'Technical'
-    }
+    
 
     def calc_std_dev(values):
         valid = [v for v in values if v is not None]
@@ -358,7 +449,7 @@ def _get_season_performance(year: int) -> dict:
             
             race_name = str(event_data['EventName']).replace(" Grand Prix", "")
             loc = str(event_data.get('Location', ''))
-            t_type = track_types.get(loc, 'Mixed')
+            t_type = TRACK_CATEGORIES.get(loc, 'Mixed')
             races.append(race_name)
             
             for d in drivers.values():
@@ -382,7 +473,7 @@ def _get_season_performance(year: int) -> dict:
                         "team": team, "points": 0, "wins": 0, "podiums": 0, "poles": 0,
                         "dnfs": 0, "grids": [None] * (len(races) - 1), "finishes": [None] * (len(races) - 1), 
                         "gained_total": 0, "points_timeline": [0] * (len(races) - 1), 
-                        "track_perf": {"High-Speed": [], "Technical": [], "Mixed": []}
+                        "cat_perf": {c: {"points": 0, "positions": [], "races": 0} for c in CATEGORIES}
                     }
                 
                 if team not in teams:
@@ -390,7 +481,7 @@ def _get_season_performance(year: int) -> dict:
                         "points": 0, "wins": 0, "podiums": 0, "poles": 0, "dnfs": 0,
                         "grids": [], "finishes": [], "drivers": set(),
                         "points_timeline": [0] * (len(races) - 1), 
-                        "track_perf": {"High-Speed": [], "Technical": [], "Mixed": []}
+                        "cat_perf": {c: {"points": 0, "positions": [], "races": 0} for c in CATEGORIES}
                     }
                 
                 d = drivers[drv]
@@ -425,11 +516,15 @@ def _get_season_performance(year: int) -> dict:
                     d["dnfs"] += 1
                     t["dnfs"] += 1
                 
-                if grid > 0 and finish > 0:
-                    d["gained_total"] += (grid - finish)
-                    d["track_perf"][t_type].append(finish)
-                    t["track_perf"][t_type].append(pts)
-                    
+                if finish and finish > 0:
+                    d["cat_perf"][t_type]["positions"].append(finish)
+                    d["cat_perf"][t_type]["races"] += 1
+                    t["cat_perf"][t_type]["positions"].append(finish)
+                    t["cat_perf"][t_type]["races"] += 1
+
+                d["cat_perf"][t_type]["points"] += pts
+                t["cat_perf"][t_type]["points"] += pts
+
                 d["points_timeline"].append(d["points"])
                 t["points_timeline"].append(t["points"])
 
@@ -453,11 +548,17 @@ def _get_season_performance(year: int) -> dict:
             "grid_history": data["grids"],
             "finish_history": data["finishes"],
             "points_timeline": data["points_timeline"],
-            "track_perf": {
-                "High-Speed": round(sum(data["track_perf"]["High-Speed"])/len(data["track_perf"]["High-Speed"]), 1) if data["track_perf"]["High-Speed"] else None,
-                "Technical": round(sum(data["track_perf"]["Technical"])/len(data["track_perf"]["Technical"]), 1) if data["track_perf"]["Technical"] else None,
-                "Mixed": round(sum(data["track_perf"]["Mixed"])/len(data["track_perf"]["Mixed"]), 1) if data["track_perf"]["Mixed"] else None
-            }
+           "cat_perf": {
+                c: {
+                    "avg_points": round(data["cat_perf"][c]["points"] / data["cat_perf"][c]["races"], 2)
+                                if data["cat_perf"][c]["races"] > 0 else 0,
+                    "avg_finish": round(sum(data["cat_perf"][c]["positions"]) / len(data["cat_perf"][c]["positions"]), 1)
+                                if data["cat_perf"][c]["positions"] else None,
+                    "races": data["cat_perf"][c]["races"],
+                    "total_points": data["cat_perf"][c]["points"],
+                }
+                for c in CATEGORIES
+            },
         })
 
     team_list = []
@@ -470,21 +571,28 @@ def _get_season_performance(year: int) -> dict:
             "wins": data["wins"], "podiums": data["podiums"], "poles": data["poles"], "dnfs": data["dnfs"],
             "avg_grid": round(avg_grid, 2), "avg_finish": round(avg_finish, 2),
             "drivers": list(data["drivers"]),
-            "track_perf_pts": {
-                "High-Speed": sum(data["track_perf"]["High-Speed"]),
-                "Technical": sum(data["track_perf"]["Technical"]),
-                "Mixed": sum(data["track_perf"]["Mixed"])
+            # "track_perf_pts": {
+            #     "High-Speed": sum(data["track_perf"]["High-Speed"]),
+            #     "Technical": sum(data["track_perf"]["Technical"]),
+            #     "Mixed": sum(data["track_perf"]["Mixed"])
+            # },
+            "cat_perf": {
+                c: {
+                    "avg_points": round(data["cat_perf"][c]["points"] / data["cat_perf"][c]["races"], 2)
+                                if data["cat_perf"][c]["races"] > 0 else 0,
+                    "avg_finish": round(sum(data["cat_perf"][c]["positions"]) / len(data["cat_perf"][c]["positions"]), 1)
+                                if data["cat_perf"][c]["positions"] else None,
+                    "races": data["cat_perf"][c]["races"],
+                    "total_points": data["cat_perf"][c]["points"],
+                }
+                for c in CATEGORIES
             },
-            "track_perf_avg": {
-                "High-Speed": round(sum(data["track_perf"]["High-Speed"])/len(data["track_perf"]["High-Speed"]), 1) if data["track_perf"]["High-Speed"] else None,
-                "Technical": round(sum(data["track_perf"]["Technical"])/len(data["track_perf"]["Technical"]), 1) if data["track_perf"]["Technical"] else None,
-                "Mixed": round(sum(data["track_perf"]["Mixed"])/len(data["track_perf"]["Mixed"]), 1) if data["track_perf"]["Mixed"] else None
-            }
         })
 
     return {
         "races": races,
         "drivers": sorted(driver_list, key=lambda x: x['points'], reverse=True),
+        "categories": CATEGORIES,
         "teams": sorted(team_list, key=lambda x: x['points'], reverse=True)
     }
 
@@ -597,3 +705,11 @@ async def get_season_races(year: int):
     except Exception as e:
         raise HTTPException(500, f"schedule load failed: {e}")
     return {"data": data}   
+
+@router.get("/{year}/{race}/tyre-degradation")
+async def tyre_degradation(year: int, race: str):
+    loop = asyncio.get_running_loop()
+    try:
+        return {"data": await loop.run_in_executor(None, _get_tyre_degradation, year, race)}
+    except Exception as e:
+        raise HTTPException(500, f"deg calc failed: {e}")
