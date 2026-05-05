@@ -3,3 +3,5 @@ live_f1/__pycache__/
 live_f1/live_f1_venv/
 live_f1/.env
 live_f1/fastf1_cache/
+.vscode/
+.stremlit/
