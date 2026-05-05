@@ -1,11 +1,10 @@
 import logging
 import os
 from pathlib import Path
-
 import fastf1
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+from routes_historic import router as historic_router
 from state import StateManager
 from replay import FastF1Replayer
 from routes import make_router
@@ -33,7 +32,7 @@ app.add_middleware(
 state = StateManager()
 replayer = FastF1Replayer(state)
 app.include_router(make_router(state, replayer))
-
+app.include_router(historic_router)
 
 @app.get("/")
 def root():

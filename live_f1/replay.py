@@ -12,9 +12,7 @@ from models import ReplayConfig
 log = logging.getLogger(__name__)
 
 
-# 2026 grid - 11 teams. Strings here are normalized (lowercased, stripped).
-# Actual team strings come from FastF1, which mirrors F1's API. Multiple
-# variants included to handle title-sponsor prefixes / legacy names.
+# 2026 grid - 11 teams. Strings normalized lowercase.
 TEAM_COLORS = {
     "mclaren": "#FF8000",
     "mclaren mastercard": "#FF8000",
@@ -41,7 +39,7 @@ TEAM_COLORS = {
     "bwt alpine f1 team": "#0093CC",
     "cadillac": "#C9B36C",
     "cadillac f1 team": "#C9B36C",
-    # legacy (pre-2026), useful if testing past sessions
+    # legacy
     "kick sauber": "#52E252",
     "stake f1 team kick sauber": "#52E252",
     "alfa romeo": "#900000",
@@ -50,7 +48,7 @@ TEAM_COLORS = {
 }
 
 
-def team_color(team_name: str | None) -> str:
+def team_color(team_name: Optional[str]) -> str:
     if not team_name:
         return "#888888"
     return TEAM_COLORS.get(team_name.strip().lower(), "#888888")
@@ -99,11 +97,23 @@ def safe_str(x):
     return str(x)
 
 
+# F1 track status codes
+TRACK_STATUS_MAP = {
+    '1': 'AllClear',
+    '2': 'Yellow',
+    '3': 'SCDeployed',
+    '4': 'SCDeployed',
+    '5': 'Red',
+    '6': 'VSCDeployed',
+    '7': 'VSCEnding',
+}
+
+
 class FastF1Replayer:
     """Loads a past F1 session via FastF1 and replays it through StateManager
     on a virtual clock so it looks like a live stream."""
 
-    TICK_INTERVAL = 0.25  # seconds of real time per tick
+    TICK_INTERVAL = 0.25
 
     def __init__(self, state: StateManager):
         self.state = state
@@ -114,18 +124,20 @@ class FastF1Replayer:
         self.virtual_seconds = 0.0
         self.total_seconds = 0.0
 
-        # caches
         self._laps: Optional[pd.DataFrame] = None
-        self._laps_time_s: Optional[np.ndarray] = None  # Time col in seconds
+        self._laps_time_s: Optional[np.ndarray] = None
         self._weather: Optional[pd.DataFrame] = None
         self._weather_time_s: Optional[np.ndarray] = None
         self._race_control: Optional[pd.DataFrame] = None
         self._rc_time_s: Optional[np.ndarray] = None
         self._rc_idx = 0
+        self._track_status: Optional[pd.DataFrame] = None
+        self._track_status_t: Optional[np.ndarray] = None
         self._car_data: dict[str, pd.DataFrame] = {}
         self._car_times: dict[str, np.ndarray] = {}
         self._pos_data: dict[str, pd.DataFrame] = {}
         self._pos_times: dict[str, np.ndarray] = {}
+        self._pit_windows: dict[str, list[tuple[float, float]]] = {}
 
     async def start(self, config: ReplayConfig):
         if self.running:
@@ -157,17 +169,6 @@ class FastF1Replayer:
         self.session = await loop.run_in_executor(None, self._load_sync)
         self._prepare_caches()
         await self._publish_drivers()
-        
-        # --- JUMP TO RACE START LOGIC ---
-        if self.config.start_at == 0.0 and self._laps is not None and not self._laps.empty:
-            lap_1 = self._laps[self._laps["LapNumber"] == 1]
-            if not lap_1.empty:
-                # Time (Lap 1 End) - LapTime (Lap 1 Duration) = Lights Out
-                lights_out = (lap_1["Time"] - lap_1["LapTime"]).min()
-                if pd.notna(lights_out):
-                    # Add a 1.0 second offset to sync with grid launch
-                    self.virtual_seconds = float(lights_out.total_seconds()) + 1.0
-
         await self.state.set_topic("session", {
             **(self.state.get("session") or {}),
             "status": "ready",
@@ -214,6 +215,30 @@ class FastF1Replayer:
                 self._rc_time_s = self._series_to_seconds(self._race_control, "Time")
         self._rc_idx = 0
 
+        if hasattr(self.session, "track_status") and self.session.track_status is not None:
+            self._track_status = self.session.track_status.copy()
+            if not self._track_status.empty and "Time" in self._track_status.columns:
+                self._track_status_t = self._series_to_seconds(self._track_status, "Time")
+
+        # pit windows per driver
+        if self._laps is not None and not self._laps.empty:
+            for drv in self.session.drivers:
+                drv_laps = self._laps[self._laps["DriverNumber"] == drv].sort_values("LapNumber")
+                windows = []
+                pending_in = None
+                for _, lap in drv_laps.iterrows():
+                    pit_in = lap.get("PitInTime")
+                    pit_out = lap.get("PitOutTime")
+                    if pd.notna(pit_in) and pending_in is None:
+                        pending_in = pit_in.total_seconds()
+                    if pd.notna(pit_out) and pending_in is not None:
+                        windows.append((pending_in, pit_out.total_seconds()))
+                        pending_in = None
+                if pending_in is not None:
+                    windows.append((pending_in, float("inf")))
+                self._pit_windows[drv] = windows
+
+        # telemetry / position - may fail per-driver if FastF1 had load issues
         for drv in self.session.drivers:
             try:
                 car = self.session.car_data[drv].copy()
@@ -229,42 +254,6 @@ class FastF1Replayer:
                     self._pos_times[drv] = self._series_to_seconds(pos, "Time")
             except Exception as e:
                 log.warning(f"no pos_data for {drv}: {e}")
-
-    def _series_to_seconds(self, df: pd.DataFrame, time_col: str = "Time") -> np.ndarray:
-        """Return time column as seconds-from-session-start regardless of dtype."""
-        if time_col not in df.columns:
-            # fall back to Date if Time is missing
-            if "Date" in df.columns:
-                s = df["Date"]
-            else:
-                return np.array([])
-        else:
-            s = df[time_col]
-
-        if pd.api.types.is_timedelta64_dtype(s):
-            return s.dt.total_seconds().to_numpy()
-        if pd.api.types.is_datetime64_any_dtype(s):
-            ref = self._reference_datetime()
-            return (s - ref).dt.total_seconds().to_numpy()
-        return np.array([])
-
-    def _reference_datetime(self) -> pd.Timestamp:
-        """Absolute datetime corresponding to virtual_seconds=0."""
-        try:
-            t0 = self.session.t0_date
-            if t0 is not None:
-                return pd.Timestamp(t0)
-        except Exception:
-            pass
-
-        # fallbacks when telemetry didn't load (no t0_date)
-        if self._race_control is not None and not self._race_control.empty and "Date" in self._race_control.columns:
-            return pd.Timestamp(self._race_control["Date"].min())
-        if self._laps is not None and not self._laps.empty and "Date" in self._laps.columns:
-            return pd.Timestamp(self._laps["Date"].min())
-        if self._weather is not None and not self._weather.empty and "Date" in self._weather.columns:
-            return pd.Timestamp(self._weather["Date"].min())
-        return pd.Timestamp(0)
 
     async def _publish_drivers(self):
         drivers = {}
@@ -293,13 +282,7 @@ class FastF1Replayer:
             loop = asyncio.get_running_loop()
             while self.running and self.virtual_seconds < self.total_seconds:
                 t0 = loop.time()
-                
-                # Prevent silent task death on NaN processing errors
-                try:
-                    await self._tick(self.virtual_seconds)
-                except Exception as e:
-                    log.error(f"Tick extraction failed at {self.virtual_seconds}: {e}")
-                
+                await self._tick(self.virtual_seconds)
                 self.virtual_seconds += self.TICK_INTERVAL * self.config.speed
                 elapsed = loop.time() - t0
                 await asyncio.sleep(max(0.0, self.TICK_INTERVAL - elapsed))
@@ -327,6 +310,10 @@ class FastF1Replayer:
         if weather:
             await self.state.set_topic("weather", weather)
 
+        ts = self._compute_track_status(vs)
+        if ts:
+            await self.state.set_topic("track_status", ts)
+
         for msg in self._consume_race_control(vs):
             await self.state.append_race_control(msg)
 
@@ -338,10 +325,19 @@ class FastF1Replayer:
     def _current_lap(self, vs: float) -> int:
         if self._laps is None or self._laps.empty:
             return 0
-        mask = self._laps["LapStartTime"].dt.total_seconds() <= vs
+        try:
+            mask = self._laps["LapStartTime"].dt.total_seconds() <= vs
+        except AttributeError:
+            return 0
         if not mask.any():
             return 0
         return int(self._laps.loc[mask, "LapNumber"].max())
+
+    def _is_in_pit(self, drv: str, vs: float) -> bool:
+        for in_t, out_t in self._pit_windows.get(drv, []):
+            if in_t <= vs < out_t:
+                return True
+        return False
 
     def _compute_timing(self, vs: float) -> dict:
         if self._laps is None or self._laps.empty:
@@ -350,13 +346,11 @@ class FastF1Replayer:
         completed = self._laps[self._laps["Time"] <= td]
         if completed.empty:
             return {}
-        # latest lap per driver up to current time
         latest = (
             completed.sort_values("Time")
             .groupby("DriverNumber", as_index=False)
             .tail(1)
         )
-        # rough race position: more laps = ahead, then earlier Time = ahead
         latest = latest.sort_values(by=["LapNumber", "Time"], ascending=[False, True]).reset_index(drop=True)
 
         result: dict[int, dict] = {}
@@ -393,6 +387,7 @@ class FastF1Replayer:
                 "compound": safe_str(row.get("Compound")),
                 "tyre_age": safe_int(row.get("TyreLife")) if pd.notna(row.get("TyreLife")) else None,
                 "pit_stops": pit_stops,
+                "in_pit": self._is_in_pit(row["DriverNumber"], vs),
             }
         return result
 
@@ -452,6 +447,20 @@ class FastF1Replayer:
             "rainfall": bool(row.get("Rainfall", False)),
         }
 
+    def _compute_track_status(self, vs: float) -> dict:
+        if self._track_status is None or self._track_status_t is None:
+            return {"code": "1", "status": "AllClear", "message": ""}
+        idx = int(np.searchsorted(self._track_status_t, vs, side="right")) - 1
+        if idx < 0:
+            return {"code": "1", "status": "AllClear", "message": ""}
+        row = self._track_status.iloc[idx]
+        code = str(row.get("Status", "1"))
+        return {
+            "code": code,
+            "status": TRACK_STATUS_MAP.get(code, "Unknown"),
+            "message": str(row.get("Message", "") or ""),
+        }
+
     def _consume_race_control(self, vs: float) -> list[dict]:
         if self._race_control is None or self._rc_time_s is None:
             return []
@@ -469,3 +478,34 @@ class FastF1Replayer:
             })
         self._rc_idx = end_idx
         return msgs
+
+    def _series_to_seconds(self, df: pd.DataFrame, time_col: str = "Time") -> np.ndarray:
+        if time_col not in df.columns:
+            if "Date" in df.columns:
+                s = df["Date"]
+            else:
+                return np.array([])
+        else:
+            s = df[time_col]
+
+        if pd.api.types.is_timedelta64_dtype(s):
+            return s.dt.total_seconds().to_numpy()
+        if pd.api.types.is_datetime64_any_dtype(s):
+            ref = self._reference_datetime()
+            return (s - ref).dt.total_seconds().to_numpy()
+        return np.array([])
+
+    def _reference_datetime(self) -> pd.Timestamp:
+        try:
+            t0 = self.session.t0_date
+            if t0 is not None:
+                return pd.Timestamp(t0)
+        except Exception:
+            pass
+        if self._race_control is not None and not self._race_control.empty and "Date" in self._race_control.columns:
+            return pd.Timestamp(self._race_control["Date"].min())
+        if self._laps is not None and not self._laps.empty and "Date" in self._laps.columns:
+            return pd.Timestamp(self._laps["Date"].min())
+        if self._weather is not None and not self._weather.empty and "Date" in self._weather.columns:
+            return pd.Timestamp(self._weather["Date"].min())
+        return pd.Timestamp(0)
