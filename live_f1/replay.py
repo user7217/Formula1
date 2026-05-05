@@ -157,6 +157,17 @@ class FastF1Replayer:
         self.session = await loop.run_in_executor(None, self._load_sync)
         self._prepare_caches()
         await self._publish_drivers()
+        
+        # --- JUMP TO RACE START LOGIC ---
+        if self.config.start_at == 0.0 and self._laps is not None and not self._laps.empty:
+            lap_1 = self._laps[self._laps["LapNumber"] == 1]
+            if not lap_1.empty:
+                # Time (Lap 1 End) - LapTime (Lap 1 Duration) = Lights Out
+                lights_out = (lap_1["Time"] - lap_1["LapTime"]).min()
+                if pd.notna(lights_out):
+                    # Add a 1.0 second offset to sync with grid launch
+                    self.virtual_seconds = float(lights_out.total_seconds()) + 1.0
+
         await self.state.set_topic("session", {
             **(self.state.get("session") or {}),
             "status": "ready",
@@ -282,7 +293,13 @@ class FastF1Replayer:
             loop = asyncio.get_running_loop()
             while self.running and self.virtual_seconds < self.total_seconds:
                 t0 = loop.time()
-                await self._tick(self.virtual_seconds)
+                
+                # Prevent silent task death on NaN processing errors
+                try:
+                    await self._tick(self.virtual_seconds)
+                except Exception as e:
+                    log.error(f"Tick extraction failed at {self.virtual_seconds}: {e}")
+                
                 self.virtual_seconds += self.TICK_INTERVAL * self.config.speed
                 elapsed = loop.time() - t0
                 await asyncio.sleep(max(0.0, self.TICK_INTERVAL - elapsed))
