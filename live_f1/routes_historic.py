@@ -40,6 +40,230 @@ router = APIRouter(prefix="/api/historic")
 # Global lock to prevent FastF1 cache corruption when React makes concurrent requests
 _F1_LOCK = threading.Lock()
 
+
+#helper functions 
+
+
+def _compute_push_scores(session) -> dict[str, list[float]]:
+    """
+    Vectorised version — reads car_data once per driver, 
+    then assigns throttle mean per lap using LapNumber index.
+    Avoids ~1000 individual get_telemetry() calls.
+    """
+    scores = {}
+    try:
+        laps = session.laps
+        for drv in session.drivers:
+            try:
+                # read full car data for driver in one shot
+                car = session.car_data[drv].copy()
+                if car.empty or 'Throttle' not in car.columns:
+                    scores[drv] = []
+                    continue
+
+                # add LapNumber to car data by merging on SessionTime
+                drv_laps = laps.pick_driver(drv)[['LapNumber', 'LapStartTime', 'Time']].copy()
+                drv_laps = drv_laps.dropna(subset=['LapStartTime', 'Time'])
+
+                # assign lap number to each telemetry sample via searchsorted
+                lap_start_times = drv_laps['LapStartTime'].dt.total_seconds().to_numpy()
+                car_times       = car['SessionTime'].dt.total_seconds().to_numpy()
+                lap_indices     = np.searchsorted(lap_start_times, car_times, side='right') - 1
+
+                car = car.copy()
+                car['_lap_idx'] = lap_indices
+
+                # per lap: mean throttle excluding brake-on samples
+                lap_scores = []
+                drv_lap_list = laps.pick_driver(drv)['LapNumber'].tolist()
+
+                for i, _ in enumerate(drv_lap_list):
+                    lap_tel = car[
+                        (car['_lap_idx'] == i) &
+                        (car['Brake'] == False)
+                    ]
+                    if len(lap_tel) < 10:
+                        lap_scores.append(None)
+                    else:
+                        lap_scores.append(float(lap_tel['Throttle'].mean()))
+
+                scores[drv] = lap_scores
+
+            except Exception:
+                scores[drv] = []
+    except Exception:
+        pass
+    return scores
+
+
+def _compute_dirty_air_laps(session) -> dict[str, set[int]]:
+    """
+    Returns {driver_number: {lap_numbers_in_dirty_air}}
+    A lap is dirty air if the driver was within 1.2s of the car ahead
+    for most of that lap. Uses lap time position ordering as proxy.
+    """
+    laps = session.laps
+    dirty = {}
+    try:
+        results = session.results
+        drv_pos = {str(r['DriverNumber']): int(r['Position']) for _, r in results.iterrows()
+                   if pd.notna(r.get('Position'))}
+
+        for lap_num in laps['LapNumber'].dropna().unique():
+            lap_slice = laps[laps['LapNumber'] == lap_num].copy()
+            if lap_slice.empty:
+                continue
+            # sort by elapsed time to find who was where on track
+            lap_slice = lap_slice.sort_values('Time')
+            drv_list = lap_slice['DriverNumber'].tolist()
+            times = lap_slice['Time'].dt.total_seconds().tolist()
+
+            for i, drv in enumerate(drv_list):
+                if i == 0:
+                    continue  # race leader, no car ahead
+                car_ahead_idx = i - 1
+                gap = times[i] - times[car_ahead_idx]
+                if 0 <= gap <= 1.2:
+                    dirty.setdefault(str(drv), set()).add(int(lap_num))
+    except Exception:
+        pass
+    return dirty
+
+
+REF_AIR_TEMP   = 40.0   # °C
+REF_TRACK_TEMP = 55.0   # °C
+# Pirelli estimate: roughly 0.003s per lap per °C above reference track temp
+# for soft/medium. Hard is slightly less sensitive.
+TEMP_SENSITIVITY = {"SOFT": 0.004, "MEDIUM": 0.003, "HARD": 0.002,
+                    "INTERMEDIATE": 0.001, "WET": 0.001}
+
+def _temp_correction(mean_track_temp: float, compound: str) -> float:
+    """
+    Returns seconds/lap to subtract from observed deg rate to normalise
+    to reference track temperature. Positive = track was hotter than ref.
+    """
+    delta = mean_track_temp - REF_TRACK_TEMP
+    sensitivity = TEMP_SENSITIVITY.get(compound.upper(), 0.003)
+    return delta * sensitivity
+
+
+
+def _compute_downforce_index(session) -> dict[str, float]:
+    """
+    Returns {driver_number: downforce_index}
+    Index > 1.0 = running more downforce than field average (slower in straights)
+    Index < 1.0 = running less downforce than field average (faster in straights)
+    Uses SpeedST (speed trap) relative to field median.
+    """
+    laps = session.laps
+    if 'SpeedST' not in laps.columns:
+        return {}
+    try:
+        field_median = laps['SpeedST'].median()
+        if pd.isna(field_median) or field_median == 0:
+            return {}
+        index = {}
+        for drv in session.drivers:
+            drv_laps = laps.pick_drivers(drv)
+            drv_median = drv_laps['SpeedST'].median()
+            if pd.notna(drv_median) and drv_median > 0:
+                # lower speed = more downforce, so invert
+                index[str(drv)] = float(field_median / drv_median)
+        return index
+    except Exception:
+        return {}
+    
+    
+def _compute_preservation_ranking(stints: list[dict]) -> list[dict]:
+    """
+    Ranks drivers by how well they preserved tyres relative to expectation.
+    
+    Method:
+      1. For each compound, compute the field median normalised deg rate
+      2. Each driver's preservation score = median - their deg rate
+         (positive = better than field, negative = worse)
+      3. Weight by r2 and stint length
+      4. Average across all stints per driver
+    
+    Returns sorted list, best preserver first.
+    """
+    from collections import defaultdict
+
+    # field median per compound (normalised, r2-weighted)
+    compound_rates: dict[str, list] = defaultdict(list)
+    for s in stints:
+        if s['r2'] >= 0.5:   # only reliable stints in field reference
+            compound_rates[s['compound']].append(
+                (s['deg_rate_normalised'], s['r2'], s['n_laps'])
+            )
+
+    compound_median: dict[str, float] = {}
+    for comp, vals in compound_rates.items():
+        weights = [r2 * n for _, r2, n in vals]
+        total_w = sum(weights) or 1
+        compound_median[comp] = sum(r * w for (r, _, _), w in zip(vals, weights)) / total_w
+
+    # per-driver weighted preservation score
+    driver_scores: dict[str, dict] = {}
+    for s in stints:
+        if s['r2'] < 0.4:
+            continue   # too noisy to count
+        ref = compound_median.get(s['compound'])
+        if ref is None:
+            continue
+
+        score    = ref - s['deg_rate_normalised']   # higher = better
+        weight   = s['r2'] * s['n_laps']
+        drv      = s['abbreviation']
+        compound = s['compound']
+
+        if drv not in driver_scores:
+            driver_scores[drv] = {
+                "abbreviation":   drv,
+                "team":           s['team'],
+                "weighted_sum":   0.0,
+                "total_weight":   0.0,
+                "by_compound":    {},
+                "avg_push_score": [],
+                "stints_counted": 0,
+            }
+
+        ds = driver_scores[drv]
+        ds["weighted_sum"]  += score * weight
+        ds["total_weight"]  += weight
+        ds["stints_counted"] += 1
+        if s['avg_push_score'] is not None:
+            ds["avg_push_score"].append(s['avg_push_score'])
+
+        if compound not in ds["by_compound"]:
+            ds["by_compound"][compound] = {"weighted_sum": 0.0, "total_weight": 0.0}
+        ds["by_compound"][compound]["weighted_sum"]  += score * weight
+        ds["by_compound"][compound]["total_weight"]  += weight
+
+    ranking = []
+    for drv, ds in driver_scores.items():
+        if ds["total_weight"] == 0:
+            continue
+        overall = ds["weighted_sum"] / ds["total_weight"]
+        by_comp = {
+            comp: round(v["weighted_sum"] / v["total_weight"], 4)
+            for comp, v in ds["by_compound"].items()
+            if v["total_weight"] > 0
+        }
+        push_scores_list = ds["avg_push_score"]
+        ranking.append({
+            "abbreviation":        drv,
+            "team":                ds["team"],
+            "preservation_score":  round(overall, 4),
+            # positive = saved X seconds/lap vs field on same compound
+            "avg_push_score":      round(float(np.mean(push_scores_list)), 1) if push_scores_list else None,
+            "stints_counted":      ds["stints_counted"],
+            "by_compound":         by_comp,
+        })
+
+    return sorted(ranking, key=lambda x: x["preservation_score"], reverse=True)
+    
+
 def to_seconds(val, t0=None):
     if val is None or pd.isna(val):
         return None
@@ -84,6 +308,8 @@ def _get_safe_session(year: int, race: str, session_type: str, telemetry: bool =
         return session
 
 
+#main functions
+
 @lru_cache(maxsize=32)
 def _get_race_results(year: int, race: str) -> list[dict]:
     session = fastf1.get_session(year, race, 'R')
@@ -109,7 +335,7 @@ def _get_driver_laps(year: int, race: str, driver: str) -> list[dict]:
     except Exception as e:
         return []
         
-    laps = session.laps.pick_driver(driver)
+    laps = session.laps.pick_drivers(driver)
     processed = []
     
     for _, row in laps.iterrows():
@@ -212,7 +438,7 @@ def _get_qualifying_analytics(year: int, race: str, session_type: str) -> dict:
             "q3": _sec(row.get('Q3')),
         })
 
-        drv_laps = laps.pick_driver(drv).pick_quicklaps() if not laps.empty else pd.DataFrame()
+        drv_laps = laps.pick_drivers(drv).pick_quicklaps() if not laps.empty else pd.DataFrame()
         attempts = []
         if not drv_laps.empty:
             for _, lap in drv_laps.iterrows():
@@ -315,7 +541,7 @@ def _get_session_overview(year: int, race: str, session_type: str = 'R') -> dict
                         "abbreviation": abbrev, "grid": int(grid), "lap1_pos": int(pos_l1), "delta": int(grid - pos_l1)
                     })
 
-        drv_laps = laps.pick_driver(drv)
+        drv_laps = laps.pick_drivers(drv)
         if drv_laps.empty:
             continue
 
@@ -355,7 +581,20 @@ def _get_session_overview(year: int, race: str, session_type: str = 'R') -> dict
         "consistency": sorted([c for c in consistency if c['variance'] > 0], key=lambda x: x['variance'])
     }
     
-def _stint_degradation(stint_laps: pd.DataFrame) -> Optional[dict]:
+def _stint_degradation(
+    stint_laps: pd.DataFrame,
+    push_scores: list[Optional[float]],   # per lap in this stint
+    dirty_air_laps: set[int],             # lap numbers in dirty air
+    mean_track_temp: float,
+    compound: str,
+) -> Optional[dict]:
+    """
+    Linear regression of lap time vs tyre age with:
+    - push score weighting (de-weight managed laps)
+    - dirty air lap exclusion
+    - temperature normalisation
+    - σ-clip outliers
+    """
     clean = stint_laps[
         (stint_laps['IsAccurate'] == True) &
         (stint_laps['TrackStatus'].astype(str).isin(['1', '2'])) &
@@ -363,64 +602,168 @@ def _stint_degradation(stint_laps: pd.DataFrame) -> Optional[dict]:
         stint_laps['TyreLife'].notna() &
         stint_laps['PitOutTime'].isna() &
         stint_laps['PitInTime'].isna()
-    ]
-    if len(clean) < 4:
+    ].copy()
+
+    # exclude dirty air laps — they inflate deg artificially
+    dirty_mask = clean['LapNumber'].isin(dirty_air_laps)
+    clean_no_dirty = clean[~dirty_mask]
+
+    # if removing dirty air leaves too little, keep them but flag it
+    dirty_air_excluded = int(dirty_mask.sum())
+    use = clean_no_dirty if len(clean_no_dirty) >= 4 else clean
+
+    if len(use) < 4:
         return None
-    x = clean['TyreLife'].to_numpy(dtype=float)
-    y = clean['LapTime'].dt.total_seconds().to_numpy()
+
+    x   = use['TyreLife'].to_numpy(dtype=float)
+    y   = use['LapTime'].dt.total_seconds().to_numpy()
+
+    # build per-lap push weights
+    # managed lap (push < 70) gets weight 0.4, full push (>90) gets 1.0
+    weights = []
+    lap_nums = use['LapNumber'].tolist()
+    all_laps = stint_laps['LapNumber'].tolist()
+    for ln in lap_nums:
+        try:
+            idx = all_laps.index(ln)
+            ps  = push_scores[idx] if idx < len(push_scores) else None
+        except (ValueError, IndexError):
+            ps = None
+        if ps is None:
+            weights.append(0.7)          # unknown — moderate weight
+        elif ps >= 90:
+            weights.append(1.0)          # full push
+        elif ps >= 75:
+            weights.append(0.8)          # moderate push
+        else:
+            weights.append(0.4)          # managing / saving tyres
+    w = np.array(weights)
+
+    # σ-clip outliers on unweighted residuals first
     mask = np.abs(y - y.mean()) < 2 * y.std()
-    x, y = x[mask], y[mask]
+    x, y, w = x[mask], y[mask], w[mask]
     if len(x) < 4:
         return None
-    slope, intercept = np.polyfit(x, y, 1)
-    y_pred = slope * x + intercept
-    ss_res = np.sum((y - y_pred) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    # raw points for frontend chart
-    points = [{"tyre_life": float(xi), "lap_time": float(yi)} for xi, yi in zip(x, y)]
+
+    # weighted least squares
+    W      = np.diag(w)
+    X_mat  = np.column_stack([np.ones_like(x), x])
+    try:
+        coeffs = np.linalg.lstsq(W @ X_mat, W @ y, rcond=None)[0]
+    except np.linalg.LinAlgError:
+        return None
+
+    intercept, slope = float(coeffs[0]), float(coeffs[1])
+
+    y_pred = intercept + slope * x
+    ss_res = float(np.sum(w * (y - y_pred) ** 2))
+    ss_tot = float(np.sum(w * (y - y.mean()) ** 2))
+    r2     = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    # temperature-normalised deg rate
+    temp_adj    = _temp_correction(mean_track_temp, compound)
+    norm_slope  = slope - temp_adj
+
+    # avg push score for this stint (managed vs pushed flag)
+    valid_ps = [p for p in push_scores if p is not None]
+    avg_push = float(np.mean(valid_ps)) if valid_ps else None
+
     return {
-        "deg_rate": float(slope),
-        "base_pace": float(intercept),
-        "n_laps": int(len(x)),
-        "r2": float(r2),
-        "points": points,
+        "deg_rate":          slope,        # raw observed
+        "deg_rate_normalised": norm_slope, # temp-adjusted, comparable cross-race
+        "base_pace":         intercept,
+        "n_laps":            int(len(x)),
+        "stint_length":      int(len(clean)),
+        "dirty_air_excluded": dirty_air_excluded,
+        "avg_push_score":    avg_push,
+        "mean_track_temp":   mean_track_temp,
+        "temp_correction":   temp_adj,
+        "r2":                r2,
+        "points": [
+            {"tyre_life": float(xi), "lap_time": float(yi)}
+            for xi, yi in zip(x, y)
+        ],
     }
 
-
 @lru_cache(maxsize=16)
-def _get_tyre_degradation(year: int, race: str) -> dict:
-    session = _get_safe_session(year, race, 'R')
-    laps = session.laps
+def _get_tyre_degradation(year: int, race, telemetry: bool = True) -> dict:
+    session = _get_safe_session(year, race, 'R', telemetry=telemetry)
+    laps    = session.laps
     results = session.results
 
-    drv_team = {str(r['DriverNumber']): str(r['TeamName']) for _, r in results.iterrows()}
+    drv_team   = {str(r['DriverNumber']): str(r['TeamName'])   for _, r in results.iterrows()}
     drv_abbrev = {str(r['DriverNumber']): str(r['Abbreviation']) for _, r in results.iterrows()}
+
+    # compute session-level context once
+    push_scores_all = _compute_push_scores(session) if telemetry else {}
+    dirty_air_all   = _compute_dirty_air_laps(session)
+    downforce_idx   = _compute_downforce_index(session) if telemetry else {}
+
+    # mean track temp for the session
+    mean_track_temp = REF_TRACK_TEMP
+    try:
+        wx = session.weather_data
+        if wx is not None and not wx.empty and 'TrackTemp' in wx.columns:
+            mean_track_temp = float(wx['TrackTemp'].mean())
+    except Exception:
+        pass
+
     stints = []
 
     for drv in session.drivers:
-        drv_laps = laps.pick_driver(drv)
+        drv_laps = laps.pick_drivers(drv)
         if drv_laps.empty:
             continue
-        team = drv_team.get(drv, "Unknown")
+
+        team   = drv_team.get(drv, "Unknown")
         abbrev = drv_abbrev.get(drv, drv)
+        drv_push = push_scores_all.get(drv, [])
+        drv_dirty = dirty_air_all.get(str(drv), set())
+        df_idx = downforce_idx.get(str(drv), 1.0)
+
         for stint_num, sl in drv_laps.groupby("Stint"):
             compound = str(sl["Compound"].iloc[0])
             if compound in ("UNKNOWN", "nan", ""):
                 continue
-            deg = _stint_degradation(sl)
+
+            # slice push scores to this stint's lap indices
+            stint_lap_nums  = sl['LapNumber'].tolist()
+            all_lap_nums    = drv_laps['LapNumber'].tolist()
+            stint_push = []
+            for ln in stint_lap_nums:
+                try:
+                    idx = all_lap_nums.index(ln)
+                    stint_push.append(drv_push[idx] if idx < len(drv_push) else None)
+                except (ValueError, IndexError):
+                    stint_push.append(None)
+
+            deg = _stint_degradation(
+                sl, stint_push, drv_dirty,
+                mean_track_temp, compound,
+            )
             if deg is None:
                 continue
+
             stints.append({
-                "driver": drv,
-                "abbreviation": abbrev,
-                "team": team,
-                "stint": int(stint_num),
-                "compound": compound,
+                "driver":          drv,
+                "abbreviation":    abbrev,
+                "team":            team,
+                "stint":           int(stint_num),
+                "compound":        compound,
+                "downforce_index": round(df_idx, 3),
                 **deg,
             })
 
-    return {"year": year, "race": race, "stints": stints}
+    # per-race tyre preservation ranking
+    preservation = _compute_preservation_ranking(stints)
+
+    return {
+        "year":         year,
+        "race":         race,
+        "track_temp":   mean_track_temp,
+        "stints":       stints,
+        "preservation": preservation,
+    }
 
 
 @lru_cache(maxsize=8)
@@ -593,6 +936,7 @@ def _get_season_performance(year: int) -> dict:
         "races": races,
         "drivers": sorted(driver_list, key=lambda x: x['points'], reverse=True),
         "categories": CATEGORIES,
+        "year": year,
         "teams": sorted(team_list, key=lambda x: x['points'], reverse=True)
     }
 
@@ -667,6 +1011,139 @@ def _get_season_races(year: int) -> list[dict]:
         })
     return out
 
+@lru_cache(maxsize=4)
+def _get_season_tyre_analysis(year: int) -> dict:
+    """
+    Aggregates per-race tyre preservation scores across the season.
+    Per team: overall preservation, per compound, per track category.
+    """
+    schedule = fastf1.get_event_schedule(year, include_testing=False)
+    now      = pd.Timestamp.now()
+    done     = schedule[schedule['EventDate'] < now]
+
+    # {team: {compound: {category: [scores]}}}
+    team_data: dict = {}
+
+    races_processed = []
+
+    for _, ev in done.iterrows():
+        race_name = str(ev['EventName']).replace(" Grand Prix", "")
+        loc       = str(ev.get('Location', ''))
+        category  = TRACK_CATEGORIES.get(loc, 'Mixed')
+
+        try:
+            data = _get_tyre_degradation(year, int(ev['RoundNumber']), telemetry=False)
+        except Exception:
+            continue
+
+        races_processed.append(race_name)
+
+        for entry in data.get("preservation", []):
+            team     = entry["team"]
+            score    = entry["preservation_score"]
+            push     = entry["avg_push_score"]
+            by_comp  = entry["by_compound"]
+
+            if team not in team_data:
+                team_data[team] = {
+                    "overall":    [],
+                    "by_compound": {},
+                    "by_category": {c: [] for c in CATEGORIES},
+                    "by_cat_compound": {},
+                }
+
+            td = team_data[team]
+            td["overall"].append(score)
+            td["by_category"][category].append(score)
+
+            for comp, comp_score in by_comp.items():
+                td["by_compound"].setdefault(comp, []).append(comp_score)
+
+                cat_key = f"{category}_{comp}"
+                td["by_cat_compound"].setdefault(cat_key, []).append(comp_score)
+
+    # summarise
+    def _summarise(scores: list[float]) -> Optional[dict]:
+        if not scores:
+            return None
+        arr = np.array(scores)
+        return {
+            "mean":   round(float(arr.mean()), 4),
+            "std":    round(float(arr.std()), 4),
+            "n":      len(scores),
+            "best":   round(float(arr.max()), 4),
+            "worst":  round(float(arr.min()), 4),
+        }
+
+    summary = []
+    for team, td in team_data.items():
+        by_comp_summary = {
+            comp: _summarise(scores)
+            for comp, scores in td["by_compound"].items()
+        }
+        by_cat_summary = {
+            cat: _summarise(scores)
+            for cat, scores in td["by_category"].items()
+            if scores
+        }
+        by_cat_comp_summary = {
+            key: _summarise(scores)
+            for key, scores in td["by_cat_compound"].items()
+            if scores
+        }
+        overall = _summarise(td["overall"])
+        if not overall:
+            continue
+
+        summary.append({
+            "team":             team,
+            "overall":          overall,
+            "by_compound":      by_comp_summary,
+            "by_category":      by_cat_summary,
+            "by_cat_compound":  by_cat_comp_summary,
+        })
+
+    # global rankings
+    ranked_overall = sorted(
+        [s for s in summary if s["overall"]],
+        key=lambda x: x["overall"]["mean"],
+        reverse=True,
+    )
+
+    # best compound per team — which compound do they manage best
+    best_compound_per_team = {}
+    for s in summary:
+        if not s["by_compound"]:
+            continue
+        best = max(s["by_compound"].items(),
+                   key=lambda x: x[1]["mean"] if x[1] else -999)
+        best_compound_per_team[s["team"]] = {
+            "compound": best[0],
+            "score":    best[1]["mean"] if best[1] else None,
+        }
+
+    # best category per team — which track type suits their tyre management
+    best_category_per_team = {}
+    for s in summary:
+        if not s["by_category"]:
+            continue
+        valid = {k: v for k, v in s["by_category"].items() if v and v["n"] >= 2}
+        if not valid:
+            continue
+        best = max(valid.items(), key=lambda x: x[1]["mean"])
+        best_category_per_team[s["team"]] = {
+            "category": best[0],
+            "score":    best[1]["mean"],
+        }
+
+    return {
+        "year":                   year,
+        "races":                  races_processed,
+        "team_summary":           ranked_overall,
+        "best_compound_per_team": best_compound_per_team,
+        "best_category_per_team": best_category_per_team,
+    }
+
 
 # --- Routes ---
 
@@ -706,10 +1183,28 @@ async def get_season_races(year: int):
         raise HTTPException(500, f"schedule load failed: {e}")
     return {"data": data}   
 
+# @router.get("/{year}/{race}/tyre-degradation")
+# async def tyre_degradation(year: int, race: str):
+#     loop = asyncio.get_running_loop()
+#     try:
+#         return {"data": await loop.run_in_executor(None, _get_tyre_degradation, year, race)}
+#     except Exception as e:
+#         raise HTTPException(500, f"deg calc failed: {e}")
+    
 @router.get("/{year}/{race}/tyre-degradation")
 async def tyre_degradation(year: int, race: str):
     loop = asyncio.get_running_loop()
     try:
-        return {"data": await loop.run_in_executor(None, _get_tyre_degradation, year, race)}
+        # telemetry=True for single race — full analysis
+        return {"data": await loop.run_in_executor(None, _get_tyre_degradation, year, race, True)}
     except Exception as e:
-        raise HTTPException(500, f"deg calc failed: {e}")
+        raise HTTPException(500, f"tyre deg failed: {e}")
+
+
+@router.get("/{year}/season-tyre-analysis")
+async def season_tyre_analysis(year: int):
+    loop = asyncio.get_running_loop()
+    try:
+        return {"data": await loop.run_in_executor(None, _get_season_tyre_analysis, year)}
+    except Exception as e:
+        raise HTTPException(500, f"season tyre analysis failed: {e}")
